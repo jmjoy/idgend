@@ -1,0 +1,26 @@
+[package]
+name = "idgend"
+version = "0.1.0"
+authors = ["jmjoy <918734043@qq.com>"]
+edition = "2018"
+publish = false
+readme = "README.md"
+license = "MIT"
+description = "🐮🍺简单粗暴的预生成唯一纯数字ID生成服务。"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.27"
+crossbeam = "0.7.3"
+env_logger = "0.7.1"
+futures = "0.3.4"
+hyper = "0.13.4"
+itertools = "0.9.0"
+log = "0.4.8"
+num_cpus = "=1.11.1" # there is a bug on my linux laptop in version "1.12"
+rand = "0.7.3"
+rocksdb = "0.13.0"
+structopt = "0.3.12"
+tokio = { version = "0.2.13", features = ["full"] }
+tonic = "0.1.1"
