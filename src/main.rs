@@ -49,6 +49,9 @@ struct Opt {
 
     #[structopt(long)]
     http_addr: Option<String>,
+
+    #[structopt(long, short = "j")]
+    core_threads: Option<usize>,
 }
 
 fn parse_range(src: &str) -> anyhow::Result<(u64, u64)> {
@@ -73,13 +76,42 @@ fn parse_range(src: &str) -> anyhow::Result<(u64, u64)> {
     Ok(range)
 }
 
-fn main() {
-    init_logger();
+struct IdDB {
+    db: DB,
+    size: u64,
+}
 
-    let opt = Opt::from_args();
+impl IdDB {
+    fn new(opt: &Opt) -> anyhow::Result<Self> {
+        let exists = opt.data_dir.exists();
+        let mut options = Options::default();
+        options.create_if_missing(!exists);
+        let db = DB::open(&options, opt.data_dir.clone())?;
 
-    if let Err(e) = run(opt) {
-        log::error!("{:?}", e);
+        if !exists {
+            log::info!(
+                "Starting pre-generate ids [{},{})...",
+                opt.range.0,
+                opt.range.1
+            );
+            generate_and_store_ids(&opt, &db)?;
+            log::info!("Ids [{},{}) has written!", opt.range.0, opt.range.1);
+        } else {
+            log::info!(
+                "Ids [{},{}) has generated previous.",
+                opt.range.0,
+                opt.range.1
+            );
+        }
+
+        let size = db_size(&db)?;
+        if size == 0 {
+            bail!("id has exhausted!");
+        }
+
+        log::info!("current db key size: {}", size);
+
+        Ok(Self { db, size })
     }
 }
 
@@ -90,23 +122,25 @@ fn init_logger() {
     env_logger::init();
 }
 
-fn build_runtime() -> anyhow::Result<Runtime> {
-    Ok(runtime::Builder::new()
-        .threaded_scheduler()
-        .enable_all()
-        .build()?)
+fn build_runtime(opt: &Opt) -> anyhow::Result<Runtime> {
+    let mut builder = runtime::Builder::new();
+    builder.threaded_scheduler().enable_all();
+    if let Some(core_threads) = opt.core_threads {
+        builder.core_threads(core_threads);
+    }
+    Ok(builder.build()?)
 }
 
 fn run(opt: Opt) -> anyhow::Result<()> {
-    let db = init_db(&opt)?;
+    let db = IdDB::new(&opt)?;
 
-    match (opt.grpc_addr, opt.http_addr) {
+    match (&opt.grpc_addr, &opt.http_addr) {
         (None, None) => {
             log::warn!("Neither grpc-addr or http-addr is setted, skip and quit.");
             Ok(())
         }
         (grpc_addr, http_addr) => {
-            let mut rt = build_runtime()?;
+            let mut rt = build_runtime(&opt)?;
 
             rt.block_on(async move {
                 let (sender, receiver) = mpsc::sync_channel(0);
@@ -151,31 +185,6 @@ fn run(opt: Opt) -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-fn init_db(opt: &Opt) -> anyhow::Result<DB> {
-    let exists = opt.data_dir.exists();
-    let mut options = Options::default();
-    options.create_if_missing(!exists);
-    let db = DB::open(&options, opt.data_dir.clone())?;
-
-    if !exists {
-        log::info!(
-            "Starting pre-generate ids [{},{})...",
-            opt.range.0,
-            opt.range.1
-        );
-        generate_and_store_ids(&opt, &db)?;
-        log::info!("Ids [{},{}) has written!", opt.range.0, opt.range.1);
-    } else {
-        log::info!(
-            "Ids [{},{}) has generated previous.",
-            opt.range.0,
-            opt.range.1
-        );
-    }
-
-    Ok(db)
 }
 
 fn generate_and_store_ids(opt: &Opt, db: &DB) -> anyhow::Result<()> {
@@ -230,9 +239,9 @@ async fn handle_http_request(
     Ok(Response::new(id.to_string().into()))
 }
 
-fn start_id_generator(sender: SyncSender<u64>, db: DB) {
+fn start_id_generator(sender: SyncSender<u64>, db: IdDB) {
     let sender = Rc::new(sender);
-    for (key, _) in db.iterator(IteratorMode::Start) {
+    for (key, _) in db.db.iterator(IteratorMode::Start) {
         let sender = sender.clone();
         let mut id = [0u8; 8];
         for i in 0..8 {
@@ -240,7 +249,7 @@ fn start_id_generator(sender: SyncSender<u64>, db: DB) {
                 *id.get_unchecked_mut(i) = *key.get_unchecked(i + 2);
             }
         }
-        if let Err(e) = db.delete(key) {
+        if let Err(e) = db.db.delete(key) {
             log::error!("delete id failed {:?}", e);
             continue;
         }
@@ -249,5 +258,20 @@ fn start_id_generator(sender: SyncSender<u64>, db: DB) {
             Ok(..) => log::debug!("generate id: {}", id),
             Err(e) => log::error!("send id failed: {:?}", e),
         }
+    }
+}
+
+fn db_size(db: &DB) -> anyhow::Result<u64> {
+    db.property_int_value("rocksdb.estimate-num-keys")?
+        .context("get property `rocksdb.estimate-num-keys` failed")
+}
+
+fn main() {
+    init_logger();
+
+    let opt = Opt::from_args();
+
+    if let Err(e) = run(opt) {
+        log::error!("{:?}", e);
     }
 }
