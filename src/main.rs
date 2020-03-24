@@ -1,33 +1,25 @@
 use anyhow::{bail, Context};
-use futures::future::try_join_all;
+use futures::future::{try_join_all, try_select, Either, FutureExt};
 use hyper::{
     service::{make_service_fn, service_fn},
     Body, Request, Response, Server, StatusCode,
 };
 use itertools::Itertools;
-use rand::{seq::SliceRandom, thread_rng, Rng};
+use rand::{thread_rng, Rng};
 use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use std::{
-    convert::Infallible,
     env,
-    net::{SocketAddr, ToSocketAddrs},
+    net::ToSocketAddrs,
     path::PathBuf,
-    rc::Rc,
     sync::{
         mpsc::{self, Receiver, Sender, SyncSender},
         Arc,
     },
-    time::Duration,
 };
 use structopt::StructOpt;
-use tokio::{
-    runtime,
-    runtime::Runtime,
-    sync::Mutex,
-    task,
-    task::{spawn, spawn_blocking},
-    time::delay_for,
-};
+use tokio::{runtime, runtime::Runtime, sync::Mutex, task};
+
+use crate::proto::{id_gen_server::IdGenServer, IdGenLogic};
 
 const NUM_RAND_PREFIXES: u16 = u16::max_value();
 
@@ -94,7 +86,7 @@ impl IdDB {
                 opt.range.0,
                 opt.range.1
             );
-            generate_and_store_ids(&opt, &db)?;
+            Self::generate_and_store_ids(&opt, &db)?;
             log::info!("Ids [{},{}) has written!", opt.range.0, opt.range.1);
         } else {
             log::info!(
@@ -104,7 +96,7 @@ impl IdDB {
             );
         }
 
-        let size = db_size(&db)?;
+        let size = Self::db_size(&db)?;
         if size == 0 {
             bail!("id has exhausted!");
         }
@@ -113,105 +105,179 @@ impl IdDB {
 
         Ok(Self { db, size })
     }
-}
 
-fn init_logger() {
-    if let Err(_) = env::var("RUST_LOG") {
-        env::set_var("RUST_LOG", "INFO");
-    }
-    env_logger::init();
-}
+    fn generate_and_store_ids(opt: &Opt, db: &DB) -> anyhow::Result<()> {
+        let mut rng = thread_rng();
+        let prefixes = (0..NUM_RAND_PREFIXES).collect::<Vec<_>>();
 
-fn build_runtime(opt: &Opt) -> anyhow::Result<Runtime> {
-    let mut builder = runtime::Builder::new();
-    builder.threaded_scheduler().enable_all();
-    if let Some(core_threads) = opt.core_threads {
-        builder.core_threads(core_threads);
-    }
-    Ok(builder.build()?)
-}
-
-fn run(opt: Opt) -> anyhow::Result<()> {
-    let db = IdDB::new(&opt)?;
-
-    match (&opt.grpc_addr, &opt.http_addr) {
-        (None, None) => {
-            log::warn!("Neither grpc-addr or http-addr is setted, skip and quit.");
-            Ok(())
-        }
-        (grpc_addr, http_addr) => {
-            let mut rt = build_runtime(&opt)?;
-
-            rt.block_on(async move {
-                let (sender, receiver) = mpsc::sync_channel(0);
-                task::spawn_blocking(move || start_id_generator(sender, db));
-                let receiver = Arc::new(Mutex::new(receiver));
-
-                let mut services = Vec::with_capacity(2);
-                if let Some(grpc_addr) = grpc_addr {}
-
-                if let Some(http_addr) = http_addr {
-                    let service = async move {
-                        let http_addr = http_addr
-                            .to_socket_addrs()?
-                            .next()
-                            .context("parse http addr failed")?;
-
-                        let receiver = receiver.clone();
-
-                        let make_svc = make_service_fn(move |_conn| {
-                            let receiver = receiver.clone();
-
-                            async move {
-                                Ok::<_, anyhow::Error>(service_fn(move |req| {
-                                    handle_http_request(req, receiver.clone())
-                                }))
-                            }
-                        });
-
-                        let server = Server::bind(&http_addr).serve(make_svc);
-
-                        server.await?;
-
-                        Ok::<_, anyhow::Error>(())
-                    };
-                    services.push(service);
+        let ranges = (opt.range.0..opt.range.1).into_iter().chunks(10000);
+        let ranges = ranges.into_iter();
+        for range in ranges {
+            let mut batch = WriteBatch::default();
+            for num in range {
+                let prefix = prefixes[rng.gen_range(0, prefixes.len())];
+                let prefix: [u8; 2] = prefix.to_le_bytes();
+                let num: [u8; 8] = num.to_le_bytes();
+                let mut buf = [0u8; 10];
+                for i in 0..2 {
+                    buf[i] = prefix[i];
                 }
-                try_join_all(services).await?;
-
-                Ok::<_, anyhow::Error>(())
-            })?;
-
-            Ok(())
+                for i in 0..8 {
+                    buf[i + 2] = num[i];
+                }
+                batch.put(&buf, &[])?;
+            }
+            db.write(batch)?;
         }
+
+        Ok(())
+    }
+
+    fn start_id_generator(mut self, id_gen_sender: SyncSender<u64>, shutdown_sender: Sender<()>) {
+        for (key, _) in self.db.iterator(IteratorMode::Start) {
+            self.size -= 1;
+            if self.size < NUM_RAND_PREFIXES as u64 {
+                log::warn!("id count is below {}!", NUM_RAND_PREFIXES);
+            }
+
+            let mut id = [0u8; 8];
+            for i in 0..8 {
+                unsafe {
+                    *id.get_unchecked_mut(i) = *key.get_unchecked(i + 2);
+                }
+            }
+
+            if let Err(e) = self.db.delete(key) {
+                log::error!("delete id failed {:?}", e);
+                continue;
+            }
+
+            let id = u64::from_le_bytes(id);
+            match id_gen_sender.send(id) {
+                Ok(..) => log::debug!("generate id: {}", id),
+                Err(e) => {
+                    log::error!("send id failed: {:?}", e);
+                    break;
+                }
+            }
+        }
+
+        if let Err(e) = shutdown_sender.send(()) {
+            log::error!("shutdown failed: {:?}", e);
+        }
+    }
+
+    fn db_size(db: &DB) -> anyhow::Result<u64> {
+        db.property_int_value("rocksdb.estimate-num-keys")?
+            .context("get property `rocksdb.estimate-num-keys` failed")
     }
 }
 
-fn generate_and_store_ids(opt: &Opt, db: &DB) -> anyhow::Result<()> {
-    let mut rng = thread_rng();
-    let prefixes = (0..NUM_RAND_PREFIXES).collect::<Vec<_>>();
+struct IdServer<'a> {
+    opt: &'a Opt,
+    iddb: IdDB,
+    id_gen: (SyncSender<u64>, AMReceiver<u64>),
+    shutdown: (Sender<()>, Receiver<()>),
+}
 
-    let ranges = (opt.range.0..opt.range.1).into_iter().chunks(10000);
-    let ranges = ranges.into_iter();
-    for range in ranges {
-        let mut batch = WriteBatch::default();
-        for num in range {
-            let prefix = prefixes[rng.gen_range(0, prefixes.len())];
-            let prefix: [u8; 2] = prefix.to_le_bytes();
-            let num: [u8; 8] = num.to_le_bytes();
-            let mut buf = [0u8; 10];
-            for i in 0..2 {
-                buf[i] = prefix[i];
-            }
-            for i in 0..8 {
-                buf[i + 2] = num[i];
-            }
-            batch.put(&buf, &[])?;
-        }
-        db.write(batch)?;
+impl<'a> IdServer<'a> {
+    fn new(opt: &'a Opt, iddb: IdDB) -> anyhow::Result<Self> {
+        let (id_gen_sender, id_gen_receiver) = mpsc::sync_channel(0);
+        let id_gen = (id_gen_sender, Arc::new(Mutex::new(id_gen_receiver)));
+        let shutdown = mpsc::channel();
+        Ok(Self {
+            opt,
+            iddb,
+            id_gen,
+            shutdown,
+        })
     }
 
-    Ok(())
+    fn run(self) -> anyhow::Result<()> {
+        match (&self.opt.grpc_addr, &self.opt.http_addr) {
+            (None, None) => {
+                bail!("Neither grpc-addr or http-addr is setted, skip and quit.");
+            }
+            _ => {
+                let mut rt = build_runtime(&self.opt)?;
+                rt.block_on(self.start_services())?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn start_services(self) -> anyhow::Result<()> {
+        let iddb = self.iddb;
+        let id_gen_sender = self.id_gen.0;
+        let id_gen_receiver = self.id_gen.1;
+        let shutdown_sender = self.shutdown.0;
+        let shutdown_receiver = self.shutdown.1;
+
+        task::spawn_blocking(move || iddb.start_id_generator(id_gen_sender, shutdown_sender));
+
+        let mut services = Vec::with_capacity(2);
+
+        if let Some(grpc_addr) = &self.opt.grpc_addr {
+            services.push(Self::start_grpc_service(grpc_addr, id_gen_receiver.clone()).boxed());
+        }
+
+        if let Some(http_addr) = &self.opt.http_addr {
+            services.push(Self::start_http_service(http_addr, id_gen_receiver.clone()).boxed());
+        }
+
+        let services_futs = try_join_all(services);
+        let shutdown_fut = task::spawn_blocking(move || {
+            if let Err(e) = shutdown_receiver.recv() {
+                log::error!("shutdown recv failed: {:?}", e);
+            }
+        });
+        match try_select(shutdown_fut, services_futs).await {
+            Err(Either::Left((e, _))) => Err(e)?,
+            Err(Either::Right((e, _))) => Err(e)?,
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    async fn start_http_service(http_addr: &str, receiver: AMReceiver<u64>) -> anyhow::Result<()> {
+        let http_addr = http_addr
+            .to_socket_addrs()?
+            .next()
+            .context("parse http addr failed")?;
+
+        let receiver = receiver.clone();
+
+        let make_svc = make_service_fn(move |_conn| {
+            let receiver = receiver.clone();
+
+            async move {
+                Ok::<_, anyhow::Error>(service_fn(move |req| {
+                    handle_http_request(req, receiver.clone())
+                }))
+            }
+        });
+
+        let server = Server::bind(&http_addr).serve(make_svc);
+        log::info!("http listen: {}", http_addr);
+        server.await?;
+
+        Ok(())
+    }
+
+    async fn start_grpc_service(grpc_addr: &str, receiver: AMReceiver<u64>) -> anyhow::Result<()> {
+        let grpc_addr = grpc_addr
+            .to_socket_addrs()?
+            .next()
+            .context("parse grpc addr failed")?;
+
+        let id_gen_logic = IdGenLogic { receiver };
+        log::info!("grpc listen: {}", grpc_addr);
+        Ok(tonic::transport::Server::builder()
+            .add_service(IdGenServer::new(id_gen_logic))
+            .serve(grpc_addr)
+            .await?)
+    }
 }
 
 async fn handle_http_request(
@@ -239,31 +305,54 @@ async fn handle_http_request(
     Ok(Response::new(id.to_string().into()))
 }
 
-fn start_id_generator(sender: SyncSender<u64>, db: IdDB) {
-    let sender = Rc::new(sender);
-    for (key, _) in db.db.iterator(IteratorMode::Start) {
-        let sender = sender.clone();
-        let mut id = [0u8; 8];
-        for i in 0..8 {
-            unsafe {
-                *id.get_unchecked_mut(i) = *key.get_unchecked(i + 2);
-            }
-        }
-        if let Err(e) = db.db.delete(key) {
-            log::error!("delete id failed {:?}", e);
-            continue;
-        }
-        let id = u64::from_le_bytes(id);
-        match sender.send(id) {
-            Ok(..) => log::debug!("generate id: {}", id),
-            Err(e) => log::error!("send id failed: {:?}", e),
+mod proto {
+    use crate::AMReceiver;
+    use tonic::{Request, Response, Status};
+
+    tonic::include_proto!("idgen");
+
+    pub(crate) struct IdGenLogic {
+        pub(crate) receiver: AMReceiver<u64>,
+    }
+
+    #[tonic::async_trait]
+    impl self::id_gen_server::IdGen for IdGenLogic {
+        async fn id(&self, _request: Request<()>) -> Result<tonic::Response<u64>, Status> {
+            let receiver = self.receiver.lock().await;
+            let id = match receiver.recv() {
+                Ok(id) => id,
+                Err(e) => {
+                    log::error!("recv failed: {:?}", e);
+                    return Err(Status::internal("id gen failed"));
+                }
+            };
+            drop(receiver);
+
+            Ok(Response::new(id))
         }
     }
 }
 
-fn db_size(db: &DB) -> anyhow::Result<u64> {
-    db.property_int_value("rocksdb.estimate-num-keys")?
-        .context("get property `rocksdb.estimate-num-keys` failed")
+fn init_logger() {
+    if let Err(_) = env::var("RUST_LOG") {
+        env::set_var("RUST_LOG", "INFO");
+    }
+    env_logger::init();
+}
+
+fn build_runtime(opt: &Opt) -> anyhow::Result<Runtime> {
+    let mut builder = runtime::Builder::new();
+    builder.threaded_scheduler().enable_all();
+    if let Some(core_threads) = opt.core_threads {
+        builder.core_threads(core_threads);
+    }
+    Ok(builder.build()?)
+}
+
+fn run(opt: Opt) -> anyhow::Result<()> {
+    let iddb = IdDB::new(&opt)?;
+    IdServer::new(&opt, iddb)?.run()?;
+    Ok(())
 }
 
 fn main() {
