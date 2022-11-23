@@ -3,7 +3,6 @@ name = "idgend"
 version = "0.1.0"
 authors = ["jmjoy <918734043@qq.com>"]
 edition = "2018"
-publish = false
 readme = "README.md"
 license = "MIT"
 description = "🐮🍺简单粗暴的预生成唯一纯数字ID生成服务。"
@@ -12,7 +11,6 @@ description = "🐮🍺简单粗暴的预生成唯一纯数字ID生成服务。"
 
 [dependencies]
 anyhow = "1.0.27"
-crossbeam = "0.7.3"
 env_logger = "0.7.1"
 futures = "0.3.4"
 hyper = "0.13.4"
