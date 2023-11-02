@@ -12,15 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-fn_params_layout = "Compressed"
-format_code_in_doc_comments = true
-format_macro_bodies = true
-format_macro_matchers = true
-format_strings = true
-imports_granularity = "Crate"
-merge_derives = true
-newline_style = "Unix"
-normalize_comments = true
-reorder_impl_items = true
-use_field_init_shorthand = true
-wrap_comments = true
+services:
+  etcd0:
+    image: quay.io/coreos/etcd:v3.5.8
+    ports:
+      - 127.0.0.1:2379:2379
+      - 127.0.0.1:2380:2380
+    volumes:
+      - /usr/share/ca-certificates/:/etc/ssl/certs:ro
+    command:
+      - /usr/local/bin/etcd
+      - --name
+      - etcd0
+      - --initial-advertise-peer-urls
+      - http://127.0.0.1:2380
+      - --listen-peer-urls
+      - http://0.0.0.0:2380
+      - --advertise-client-urls
+      - http://127.0.0.1:2379
+      - --listen-client-urls
+      - http://0.0.0.0:2379
+      - --initial-cluster
+      - etcd0=http://127.0.0.1:2380
