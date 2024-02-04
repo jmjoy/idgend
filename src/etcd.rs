@@ -1,55 +1,29 @@
-// Copyright 2023 jmjoy
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-use crate::args::{Args, ARGS};
-use etcd_client::{Client, ConnectOptions, Error::GRpcStatus, KvClient};
-use futures::Future;
-use once_cell::sync::Lazy;
-use std::time::Duration;
-use tokio::{runtime::Handle, sync::OnceCell, task};
+use crate::args::Args;
+use etcd_client::{Client, ConnectOptions, Error::GRpcStatus};
+use std::{future::Future, time::Duration};
 use tonic::Code;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info};
 
-pub static ETCD_CLIENT: Lazy<Client> = Lazy::new(|| {
-    task::block_in_place(move || {
-        Handle::current().block_on(async move {
-            let etcd_server = ARGS
-                .etcd_server
-                .iter()
-                .map(|server| server.to_string())
-                .collect::<Vec<_>>();
+pub async fn init_etcd_client(args: &Args) -> anyhow::Result<Client> {
+    let etcd_server = args
+        .etcd_server
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
-            let client = Client::connect(
-                &etcd_server,
-                Some(
-                    ConnectOptions::new()
-                        .with_timeout(Duration::from_secs(30))
-                        .with_keep_alive(Duration::from_secs(10), Duration::from_secs(6)),
-                ),
-            )
-            .await
-            .expect("create etcd client failed");
+    let client = Client::connect(
+        &etcd_server,
+        Some(
+            ConnectOptions::new()
+                .with_timeout(Duration::from_secs(30))
+                .with_keep_alive(Duration::from_secs(10), Duration::from_secs(6)),
+        ),
+    )
+    .await?;
 
-            info!(endpoints = etcd_server.join(", "), "etcd client created");
+    info!(endpoints = etcd_server.join(", "), "etcd client created");
 
-            client
-        })
-    })
-});
-
-pub fn init_etcd_client() {
-    Lazy::force(&ETCD_CLIENT);
+    Ok(client)
 }
 
 #[derive(Debug, Clone, Copy)]

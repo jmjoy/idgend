@@ -1,42 +1,63 @@
-// Copyright 2023 jmjoy
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #![warn(rust_2018_idioms, clippy::dbg_macro, clippy::print_stdout)]
 #![doc = include_str!("../README.md")]
 
-mod app;
 mod args;
 mod elect;
 mod etcd;
 mod http;
 mod id;
-mod lock;
 mod log;
-mod shard;
-mod utils;
+mod rt;
+mod state;
 
-use crate::{
-    app::run,
-    args::{init_args, Args, ARGS},
-    log::init_logger,
-};
-use clap::Parser;
+use crate::{args::init_args, log::init_logger};
+use elect::{run_elect_master, run_observe_master};
 use etcd::init_etcd_client;
-use once_cell::sync::Lazy;
+use futures::future::try_join_all;
+use http::run_http_server;
+use id::run_id_gen_worker;
+use rt::{create_tokio_runtime, join_handle, shutdown_signal};
+use state::AppState;
+use tokio::sync::oneshot;
 
-fn main() {
-    init_args();
-    init_logger();
-    run();
+fn main() -> anyhow::Result<()> {
+    let args = init_args();
+
+    init_logger(&args);
+
+    let rt = create_tokio_runtime(&args)?;
+
+    rt.block_on(async move {
+        let etcd_client = init_etcd_client(&args).await?;
+
+        let (id_tx, id_rx) = flume::bounded(0);
+
+        let shutdown_signal = shutdown_signal();
+
+        let app_state = AppState::new(args, etcd_client, id_rx);
+
+        let (master_tx, master_rx) = oneshot::channel();
+
+        try_join_all([
+            join_handle(run_id_gen_worker(
+                app_state.clone(),
+                id_tx,
+                master_rx,
+                shutdown_signal.subscribe(),
+            )),
+            join_handle(run_http_server(
+                app_state.clone(),
+                shutdown_signal.subscribe(),
+            )),
+            join_handle(run_elect_master(
+                app_state.clone(),
+                master_tx,
+                shutdown_signal.subscribe(),
+            )),
+            join_handle(run_observe_master(app_state, shutdown_signal.subscribe())),
+        ])
+        .await?;
+
+        Ok(())
+    })
 }
