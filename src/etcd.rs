@@ -48,14 +48,14 @@ where
                         if let RetryTime::N(n) = retry_time {
                             time += 1;
                             if time >= n {
-                                return Err(err.into());
+                                return Err(err);
                             }
                         }
                         debug!("timeout, retry again");
                         continue;
                     }
                 }
-                return Err(err.into());
+                return Err(err);
             }
         }
     }

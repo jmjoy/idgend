@@ -11,7 +11,7 @@ pub struct Args {
 
     /// Etcd server list.
     #[arg(long, required = true)]
-    pub etcd_server: Vec<SocketAddr>,
+    pub etcd_server: Vec<String>,
 
     /// Etcd prefix path.
     #[arg(long, default_value = "/idgend")]

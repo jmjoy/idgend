@@ -49,7 +49,7 @@ async fn gen_id_by_proxy(state: AppState) -> anyhow::Result<String> {
 pub fn run_http_server(
     app_state: AppState, mut shutdown_rx: broadcast::Receiver<()>,
 ) -> JoinHandle<anyhow::Result<()>> {
-    let addr = app_state.args().web_addr.clone();
+    let addr = app_state.args().web_addr;
 
     let app = Router::new().route("/id", get(id)).with_state(app_state);
 

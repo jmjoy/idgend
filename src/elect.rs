@@ -45,7 +45,7 @@ pub fn run_elect_master(
 
             state.set_master();
             state.swap_leader_key(leader_key);
-            if let Err(_) = master_tx.send(()) {
+            if master_tx.send(()).is_err() {
                 bail!("master tx send failed");
             }
 

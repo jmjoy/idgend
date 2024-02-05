@@ -34,14 +34,14 @@ pub fn run_id_gen_worker(
 
             info!("start id gen worker");
 
-            let mut kv_client = app_state.etcd_client().kv_client();
+            let kv_client = app_state.etcd_client().kv_client();
 
             let last_id_key = format!("{}/last-id", prefix);
 
             let mut rng = SmallRng::from_entropy();
 
             loop {
-                match id_gen(&mut kv_client, &*last_id_key, &mut rng).await {
+                match id_gen(&kv_client, &last_id_key, &mut rng).await {
                     Ok(id) => id_tx.send_async(id).await?,
                     Err(err) => break Err(err),
                 }
